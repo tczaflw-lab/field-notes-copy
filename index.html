@@ -1363,7 +1363,7 @@
           <label class="import-button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
             导入音频
-            <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.wave,.m4a,.m4b,.aac,.adts,.flac,.ogg,.oga,.opus,.webm,.mp4,.aiff,.aif,.caf,.amr,.3gp,.3gpp,.wma,.ac3,.ec3" multiple>
+            <input id="fileInput" type="file" multiple aria-label="选择本地音频文件">
           </label>
           <div class="playlist-actions">
             <button id="reorderButton" class="reorder-button" type="button" aria-pressed="false" title="进入独立的单列拖拽排序模式">调整顺序</button>
@@ -1450,7 +1450,7 @@
     </div>
   </div>
 
-  <audio id="audioPlayer" preload="auto" playsinline></audio>
+  <audio id="audioPlayer" preload="metadata" playsinline></audio>
 
   <script>
     (() => {
@@ -1529,11 +1529,6 @@
         rose: '樱粉柔光'
       };
 
-      const AUDIO_EXTENSIONS = new Set([
-        'mp3', 'wav', 'wave', 'm4a', 'm4b', 'aac', 'adts', 'flac', 'ogg', 'oga', 'opus',
-        'webm', 'mp4', 'aiff', 'aif', 'caf', 'amr', '3gp', '3gpp', 'wma', 'ac3', 'ec3'
-      ]);
-
       // 同一音频后缀在桌面端和移动端的文件选择器中，可能返回不同 MIME。
       // 第一项使用规范 MIME；后续项用于移动端解码器拒绝规范 MIME 时自动重试。
       const AUDIO_MIME_CANDIDATES_BY_EXTENSION = {
@@ -1561,9 +1556,32 @@
         ec3: ['audio/eac3']
       };
 
-      const DB_NAME = 'english-focus-player-audio-library';
-      const DB_VERSION = 1;
+      const AUDIO_FORMATS = {
+        mp3: { label: 'MP3', extensions: ['mp3'], mime: ['audio/mpeg'] },
+        m4a: { label: 'M4A/AAC', extensions: ['m4a', 'm4b', 'm4p'], mime: ['audio/mp4', 'audio/x-m4a', 'video/mp4'] },
+        mp4: { label: 'MP4 音频容器', extensions: ['mp4'], mime: ['audio/mp4', 'video/mp4'] },
+        aac: { label: 'AAC', extensions: ['aac', 'adts'], mime: ['audio/aac', 'audio/x-aac', 'audio/aacp'] },
+        wav: { label: 'WAV', extensions: ['wav', 'wave'], mime: ['audio/wav', 'audio/x-wav'] },
+        flac: { label: 'FLAC', extensions: ['flac'], mime: ['audio/flac', 'audio/x-flac'] },
+        ogg: { label: 'OGG', extensions: ['ogg', 'oga'], mime: ['audio/ogg'] },
+        opus: { label: 'OPUS', extensions: ['opus'], mime: ['audio/ogg', 'audio/opus'] },
+        webm: { label: 'WebM 音频容器', extensions: ['webm'], mime: ['audio/webm'] },
+        aiff: { label: 'AIFF', extensions: ['aiff', 'aif'], mime: ['audio/aiff', 'audio/x-aiff'] },
+        caf: { label: 'CAF', extensions: ['caf'], mime: ['audio/x-caf'] },
+        amr: { label: 'AMR', extensions: ['amr'], mime: ['audio/amr'] },
+        '3gp': { label: '3GPP', extensions: ['3gp', '3gpp'], mime: ['audio/3gpp', 'video/3gpp'] },
+        wma: { label: 'WMA', extensions: ['wma'], mime: ['audio/x-ms-wma'] },
+        ac3: { label: 'AC-3', extensions: ['ac3'], mime: ['audio/ac3'] },
+        ec3: { label: 'E-AC-3', extensions: ['ec3'], mime: ['audio/eac3'] }
+      };
+
+      // GitHub Pages 项目站点共用同一个 *.github.io origin；按路径隔离存储，避免复制版升级碰到原站数据库。
+      const STORAGE_PATH_KEY = (location.pathname.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'root').replace(/^-+|-+$/g, '') || 'root';
+      const STORAGE_PREFIX = `english-focus-player:${STORAGE_PATH_KEY}:`;
+      const DB_NAME = `english-focus-player-audio-library-${STORAGE_PATH_KEY}`;
+      const DB_VERSION = 2;
       const TRACK_STORE = 'tracks';
+      const TRACK_METADATA_STORE = 'trackMetadata';
 
       const state = {
         tracks: [],
@@ -1586,6 +1604,14 @@
         playRequestSerial: 0,
         playIntent: false,
         mimeRetrying: false,
+        mimeRetryCount: 0,
+        diagnosticsEnabled: new URLSearchParams(location.search).get('debug') === '1',
+        diagnostics: [],
+        retiredObjectUrls: new Set(),
+        durationProbeQueue: [],
+        durationProbeByTrack: new Map(),
+        activeDurationProbes: 0,
+        restorePromise: null,
         reorderMode: false,
         playlistDragActive: false,
         playlistRenderPending: false,
@@ -1593,23 +1619,80 @@
       };
 
       let importQueue = Promise.resolve();
+      let audioWriteQueue = Promise.resolve();
       let orderPersistQueue = Promise.resolve();
       let orderPersistRevision = 0;
+
+      function recordDiagnostic(event, details = {}) {
+        if (!state.diagnosticsEnabled) return;
+        const entry = {
+          time: new Date().toISOString(),
+          event,
+          details: { ...details }
+        };
+        state.diagnostics.push(entry);
+        if (state.diagnostics.length > 300) state.diagnostics.shift();
+        console.info('[播放器诊断]', entry);
+      }
+
+      function browserEnvironment() {
+        const ua = navigator.userAgent || '';
+        const browserPatterns = [
+          ['Edge', /Edg(?:A|iOS)?\/([\d.]+)/],
+          ['Samsung Internet', /SamsungBrowser\/([\d.]+)/],
+          ['Firefox iOS', /FxiOS\/([\d.]+)/],
+          ['Firefox', /Firefox\/([\d.]+)/],
+          ['Chrome iOS', /CriOS\/([\d.]+)/],
+          ['Chrome', /(?:Chrome|Chromium)\/([\d.]+)/],
+          ['Safari', /Version\/([\d.]+).*Safari/]
+        ];
+        const browser = browserPatterns.map(([name, pattern]) => {
+          const match = ua.match(pattern);
+          return match ? { name, version: match[1] } : null;
+        }).find(Boolean) || { name: '未知浏览器', version: '' };
+        const platform = navigator.platform || '';
+        const isIPad = /iPad/.test(ua) || (/Mac/.test(platform) && (navigator.maxTouchPoints || 0) > 1);
+        const os = /iPhone|iPod/.test(ua) || isIPad ? 'iOS/iPadOS'
+          : /Android/.test(ua) ? 'Android'
+            : /Win/.test(platform) ? 'Windows'
+              : /Mac/.test(platform) ? 'macOS'
+                : /Linux/.test(platform) ? 'Linux' : '未知系统';
+        const osVersionMatch = os === 'iOS/iPadOS' ? ua.match(/(?:CPU (?:iPhone )?OS|iPhone OS) ([\d_]+)/)
+          : os === 'Android' ? ua.match(/Android ([\d.]+)/)
+            : os === 'Windows' ? ua.match(/Windows NT ([\d.]+)/)
+              : null;
+        return {
+          browser,
+          os,
+          osVersion: osVersionMatch ? osVersionMatch[1].replace(/_/g, '.') : '',
+          platform,
+          userAgent: ua,
+          language: navigator.language || '',
+          online: navigator.onLine,
+          secureContext: Boolean(window.isSecureContext)
+        };
+      }
+
+      function enqueueAudioWrite(operation) {
+        const task = audioWriteQueue.then(operation);
+        audioWriteQueue = task.catch(() => {});
+        return task;
+      }
 
       const storage = {
         get(key, fallback = null) {
           try {
-            const value = localStorage.getItem(key);
+            const value = localStorage.getItem(`${STORAGE_PREFIX}${key}`);
             return value === null ? fallback : value;
           } catch (_) {
             return fallback;
           }
         },
         set(key, value) {
-          try { localStorage.setItem(key, String(value)); } catch (_) {}
+          try { localStorage.setItem(`${STORAGE_PREFIX}${key}`, String(value)); } catch (_) {}
         },
         remove(key) {
-          try { localStorage.removeItem(key); } catch (_) {}
+          try { localStorage.removeItem(`${STORAGE_PREFIX}${key}`); } catch (_) {}
         }
       };
 
@@ -1624,17 +1707,50 @@
               return;
             }
 
+            let settled = false;
+            const settle = (callback, value) => {
+              if (settled) return false;
+              settled = true;
+              callback(value);
+              return true;
+            };
             const request = indexedDB.open(DB_NAME, DB_VERSION);
             request.addEventListener('upgradeneeded', () => {
               const db = request.result;
               if (!db.objectStoreNames.contains(TRACK_STORE)) {
-                const store = db.createObjectStore(TRACK_STORE, { keyPath: 'id' });
-                store.createIndex('order', 'order', { unique: false });
+                db.createObjectStore(TRACK_STORE, { keyPath: 'id' });
+              }
+              if (!db.objectStoreNames.contains(TRACK_METADATA_STORE)) {
+                const metadataStore = db.createObjectStore(TRACK_METADATA_STORE, { keyPath: 'id' });
+                metadataStore.createIndex('order', 'order', { unique: false });
+                const migration = request.transaction.objectStore(TRACK_STORE).openCursor();
+                migration.addEventListener('success', () => {
+                  const cursor = migration.result;
+                  if (!cursor) return;
+                  const legacy = cursor.value || {};
+                  if (legacy.id) {
+                    const metadata = { ...legacy };
+                    delete metadata.blob;
+                    metadataStore.put(metadata);
+                  }
+                  cursor.continue();
+                });
               }
             });
-            request.addEventListener('success', () => resolve(request.result));
-            request.addEventListener('error', () => reject(request.error || new Error('无法打开音频数据库。')));
-            request.addEventListener('blocked', () => reject(new Error('音频数据库被其他页面占用，请关闭旧页面后重试。')));
+            request.addEventListener('success', () => {
+              const db = request.result;
+              db.addEventListener('versionchange', () => {
+                db.close();
+                this.dbPromise = null;
+                recordDiagnostic('indexeddb-versionchange-closed');
+              });
+              if (!settle(resolve, db)) db.close();
+            });
+            request.addEventListener('error', () => settle(reject, request.error || new Error('无法打开音频数据库。')));
+            request.addEventListener('blocked', () => {
+              recordDiagnostic('indexeddb-open-blocked');
+              settle(reject, new Error('音频数据库被其他页面占用，请关闭旧页面后重试。'));
+            });
           }).catch(error => {
             this.dbPromise = null;
             throw error;
@@ -1645,51 +1761,93 @@
         async getAll() {
           const db = await this.open();
           return new Promise((resolve, reject) => {
-            const transaction = db.transaction(TRACK_STORE, 'readonly');
-            const request = transaction.objectStore(TRACK_STORE).getAll();
-            request.addEventListener('success', () => resolve(request.result || []));
-            request.addEventListener('error', () => reject(request.error || transaction.error));
-            transaction.addEventListener('abort', () => reject(transaction.error || new Error('读取音频库失败。')));
+            const transaction = db.transaction([TRACK_STORE, TRACK_METADATA_STORE], 'readonly');
+            const tracksRequest = transaction.objectStore(TRACK_STORE).getAll();
+            const metadataRequest = transaction.objectStore(TRACK_METADATA_STORE).getAll();
+            let tracks = null;
+            let metadata = null;
+            let settled = false;
+            const fail = error => {
+              if (settled) return;
+              settled = true;
+              reject(error || transaction.error || new Error('读取音频库失败。'));
+            };
+            const finish = () => {
+              if (settled || !tracks || !metadata) return;
+              settled = true;
+              const blobsById = new Map(tracks.map(record => [record.id, record]));
+              const merged = metadata.map(record => ({ ...record, blob: blobsById.get(record.id)?.blob }));
+              const knownIds = new Set(metadata.map(record => record.id));
+              tracks.forEach(record => {
+                if (!knownIds.has(record.id)) merged.push(record);
+              });
+              resolve(merged);
+            };
+            tracksRequest.addEventListener('success', () => { tracks = tracksRequest.result || []; finish(); });
+            metadataRequest.addEventListener('success', () => { metadata = metadataRequest.result || []; finish(); });
+            tracksRequest.addEventListener('error', () => fail(tracksRequest.error));
+            metadataRequest.addEventListener('error', () => fail(metadataRequest.error));
+            transaction.addEventListener('abort', () => fail(transaction.error));
           });
         },
 
-        async put(track, orderOverride = null) {
+        async putNew(track, orderOverride = null) {
           const db = await this.open();
           return new Promise((resolve, reject) => {
-            const transaction = db.transaction(TRACK_STORE, 'readwrite');
-            const store = transaction.objectStore(TRACK_STORE);
-            const request = store.get(track.id);
-
+            const transaction = db.transaction([TRACK_STORE, TRACK_METADATA_STORE], 'readwrite');
+            const tracks = transaction.objectStore(TRACK_STORE);
+            const metadata = transaction.objectStore(TRACK_METADATA_STORE);
+            const request = metadata.get(track.id);
             request.addEventListener('success', () => {
               const existing = request.result || null;
-              // 音频元数据、时长、MIME 等异步保存必须保留数据库里已经确认的顺序。
-              // 只有显式传入 orderOverride 时，才允许改动 order。
-              const preservedOrder = existing && Number.isFinite(Number(existing.order))
-                ? Number(existing.order)
-                : null;
+              const preservedOrder = existing && Number.isFinite(Number(existing.order)) ? Number(existing.order) : null;
               const resolvedOrder = Number.isFinite(orderOverride)
                 ? Number(orderOverride)
                 : (preservedOrder ?? (Number.isFinite(track.order) ? track.order : Date.now()));
-              const record = {
-                id: track.id,
-                blob: track.blob,
-                fileName: track.fileName,
-                name: track.name,
-                type: track.blob?.type || track.type || '',
-                lastModified: track.lastModified || 0,
-                size: track.blob?.size || track.size || 0,
-                duration: Number.isFinite(track.duration) ? track.duration : 0,
-                addedAt: track.addedAt || Date.now(),
-                order: resolvedOrder
-              };
-              store.put(record);
+              const originalBlob = track.file || track.blob;
+              tracks.put({ id: track.id, blob: originalBlob });
+              metadata.put(this.metadataRecord(track, resolvedOrder));
             });
-            request.addEventListener('error', () => {
-              try { transaction.abort(); } catch (_) {}
-            });
+            request.addEventListener('error', () => { try { transaction.abort(); } catch (_) {} });
             transaction.addEventListener('complete', () => resolve());
             transaction.addEventListener('error', () => reject(transaction.error || new Error('保存音频失败。')));
             transaction.addEventListener('abort', () => reject(transaction.error || new Error('保存音频被中止。')));
+          });
+        },
+
+        metadataRecord(track, order) {
+          const originalBlob = track.file || track.blob;
+          return {
+            id: track.id,
+            fileName: track.fileName,
+            name: track.name,
+            type: originalBlob?.type || track.type || '',
+            detectedFormat: track.detectedFormat || '',
+            lastModified: track.lastModified || 0,
+            size: originalBlob?.size || track.size || 0,
+            duration: Number.isFinite(track.duration) ? track.duration : 0,
+            addedAt: track.addedAt || Date.now(),
+            order: Number.isFinite(order) ? order : (Number.isFinite(track.order) ? track.order : Date.now())
+          };
+        },
+
+        async updateMetadata(track, orderOverride = null) {
+          const db = await this.open();
+          return new Promise((resolve, reject) => {
+            const transaction = db.transaction(TRACK_METADATA_STORE, 'readwrite');
+            const store = transaction.objectStore(TRACK_METADATA_STORE);
+            const request = store.get(track.id);
+            request.addEventListener('success', () => {
+              const existing = request.result || {};
+              const order = Number.isFinite(orderOverride)
+                ? Number(orderOverride)
+                : (Number.isFinite(Number(existing.order)) ? Number(existing.order) : track.order);
+              store.put(this.metadataRecord(track, order));
+            });
+            request.addEventListener('error', () => { try { transaction.abort(); } catch (_) {} });
+            transaction.addEventListener('complete', () => resolve());
+            transaction.addEventListener('error', () => reject(transaction.error || new Error('保存音频信息失败。')));
+            transaction.addEventListener('abort', () => reject(transaction.error || new Error('保存音频信息被中止。')));
           });
         },
 
@@ -1698,8 +1856,8 @@
           if (!updates.length) return;
           const db = await this.open();
           return new Promise((resolve, reject) => {
-            const transaction = db.transaction(TRACK_STORE, 'readwrite');
-            const store = transaction.objectStore(TRACK_STORE);
+          const transaction = db.transaction(TRACK_METADATA_STORE, 'readwrite');
+            const store = transaction.objectStore(TRACK_METADATA_STORE);
 
             // 所有顺序更新放在同一个事务中提交，避免逐条写入时留下“半新半旧”的中间顺序。
             updates.forEach(entry => {
@@ -1724,8 +1882,9 @@
         async delete(id) {
           const db = await this.open();
           return new Promise((resolve, reject) => {
-            const transaction = db.transaction(TRACK_STORE, 'readwrite');
+            const transaction = db.transaction([TRACK_STORE, TRACK_METADATA_STORE], 'readwrite');
             transaction.objectStore(TRACK_STORE).delete(id);
+            transaction.objectStore(TRACK_METADATA_STORE).delete(id);
             transaction.addEventListener('complete', () => resolve());
             transaction.addEventListener('error', () => reject(transaction.error || new Error('删除已保存音频失败。')));
             transaction.addEventListener('abort', () => reject(transaction.error || new Error('删除操作被中止。')));
@@ -1735,8 +1894,9 @@
         async clear() {
           const db = await this.open();
           return new Promise((resolve, reject) => {
-            const transaction = db.transaction(TRACK_STORE, 'readwrite');
+            const transaction = db.transaction([TRACK_STORE, TRACK_METADATA_STORE], 'readwrite');
             transaction.objectStore(TRACK_STORE).clear();
+            transaction.objectStore(TRACK_METADATA_STORE).clear();
             transaction.addEventListener('complete', () => resolve());
             transaction.addEventListener('error', () => reject(transaction.error || new Error('清空已保存音频失败。')));
             transaction.addEventListener('abort', () => reject(transaction.error || new Error('清空操作被中止。')));
@@ -1745,26 +1905,54 @@
       };
 
       async function ensurePersistentStorage() {
-        if (!navigator.storage) return false;
+        if (!navigator.storage) {
+          recordDiagnostic('storage-persistence', { supported: false, granted: false });
+          return false;
+        }
         try {
           if (typeof navigator.storage.persisted === 'function') {
             const alreadyPersistent = await navigator.storage.persisted();
             if (alreadyPersistent) {
               state.persistentStorageGranted = true;
+              recordDiagnostic('storage-persistence', { supported: true, granted: true, alreadyPersistent: true });
               return true;
             }
           }
-          if (typeof navigator.storage.persist !== 'function') return false;
+          if (typeof navigator.storage.persist !== 'function') {
+            recordDiagnostic('storage-persistence', { supported: false, granted: false });
+            return false;
+          }
           state.persistentStorageGranted = Boolean(await navigator.storage.persist());
+          recordDiagnostic('storage-persistence', { supported: true, granted: state.persistentStorageGranted });
           return state.persistentStorageGranted;
         } catch (error) {
-          console.warn('无法申请持久化存储权限', error);
+          recordDiagnostic('storage-persistence-failed', { name: error?.name || '', message: error?.message || '' });
           return false;
         }
       }
 
       function clamp(value, min, max) {
         return Math.min(max, Math.max(min, value));
+      }
+
+      async function mapWithConcurrency(items, limit, mapper) {
+        const values = Array.from(items || []);
+        const results = new Array(values.length);
+        let nextIndex = 0;
+        const workerCount = Math.min(values.length, Math.max(1, Math.floor(limit) || 1));
+        await Promise.all(Array.from({ length: workerCount }, async () => {
+          while (true) {
+            const index = nextIndex;
+            nextIndex += 1;
+            if (index >= values.length) return;
+            try {
+              results[index] = await mapper(values[index], index);
+            } catch (error) {
+              results[index] = { error };
+            }
+          }
+        }));
+        return results;
       }
 
       function formatTime(value) {
@@ -1789,102 +1977,291 @@
         return match ? match[1] : '';
       }
 
-      function isLikelyAudio(file) {
-        const declaredType = String(file?.type || '').toLowerCase();
-        return Boolean(file && (declaredType.startsWith('audio/') || AUDIO_EXTENSIONS.has(fileExtension(file.name))));
+      function normalizedMimeType(type) {
+        return String(type || '').toLowerCase().split(';')[0].trim();
       }
 
-      function audioMimeCandidates(filename, declaredType = '') {
+      function audioMimeCandidates(filename, declaredType = '', detectedFormat = '') {
         const extension = fileExtension(filename);
-        const declared = String(declaredType || '').toLowerCase().split(';')[0].trim();
-        const inferred = AUDIO_MIME_CANDIDATES_BY_EXTENSION[extension] || [];
+        const declared = normalizedMimeType(declaredType);
+        const detected = AUDIO_FORMATS[detectedFormat];
+        const inferred = detected?.mime || AUDIO_MIME_CANDIDATES_BY_EXTENSION[extension] || [];
         const candidates = [...inferred];
-        if (declared && declared !== 'application/octet-stream') candidates.push(declared);
+        if (!detected && declared.startsWith('audio/') && declared !== 'application/octet-stream') candidates.push(declared);
         return [...new Set(candidates.filter(Boolean))];
       }
 
-      function normalizeAudioBlob(blob, filename = blob?.name, forcedType = '') {
-        if (!(blob instanceof Blob)) return blob;
-        const currentType = String(blob.type || '').toLowerCase().split(';')[0].trim();
-        const candidates = audioMimeCandidates(filename, currentType);
-        const targetType = String(forcedType || candidates[0] || currentType).toLowerCase();
-        // 即使手机返回 audio/x-m4a 或 audio/x-aac，也统一改成规范 MIME，
-        // 不能只判断它是否以 audio/ 开头。
-        if (!targetType || currentType === targetType) return blob;
-        return new Blob([blob], { type: targetType });
+      function readFileHeader(file, timeoutMs = 15000) {
+        return new Promise((resolve, reject) => {
+          if (typeof FileReader !== 'function') {
+            reject(new Error('当前浏览器无法读取所选文件。'));
+            return;
+          }
+          const reader = new FileReader();
+          let settled = false;
+          const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            callback(value);
+          };
+          const timeout = setTimeout(() => {
+            try { reader.abort(); } catch (_) {}
+            finish(reject, new Error('读取文件超时；如果文件位于 iCloud 或云盘，请先下载到设备后重试。'));
+          }, timeoutMs);
+          reader.addEventListener('load', () => finish(resolve, new Uint8Array(reader.result || new ArrayBuffer(0))));
+          reader.addEventListener('error', () => finish(reject, reader.error || new Error('无法读取文件内容。')));
+          reader.addEventListener('abort', () => finish(reject, new Error('文件读取已中止。')));
+          try {
+            reader.readAsArrayBuffer(file.slice(0, 8192));
+          } catch (error) {
+            finish(reject, error);
+          }
+        });
+      }
+
+      function detectAudioFormat(header, filename = '', declaredType = '') {
+        const bytes = header instanceof Uint8Array ? header : new Uint8Array(header || 0);
+        const ascii = (offset, length) => String.fromCharCode(...bytes.subarray(offset, offset + length));
+        const startsWith = text => ascii(0, text.length) === text;
+        const extension = fileExtension(filename);
+        const declared = normalizedMimeType(declaredType);
+        const hasFrameSync = () => {
+          for (let i = 0; i + 3 < bytes.length; i += 1) {
+            if (bytes[i] !== 0xff || (bytes[i + 1] & 0xe0) !== 0xe0) continue;
+            const layer = (bytes[i + 1] >> 1) & 0x03;
+            const bitrate = (bytes[i + 2] >> 4) & 0x0f;
+            const sampleRate = (bytes[i + 2] >> 2) & 0x03;
+            if (layer !== 0 && bitrate !== 0 && bitrate !== 0x0f && sampleRate !== 3) return true;
+          }
+          return false;
+        };
+
+        if (startsWith('fLaC')) return 'flac';
+        if (startsWith('caff')) return 'caf';
+        if ((startsWith('RIFF') || startsWith('RIFX') || startsWith('RF64')) && ascii(8, 4) === 'WAVE') return 'wav';
+        if (startsWith('FORM') && ['AIFF', 'AIFC'].includes(ascii(8, 4))) return 'aiff';
+        if (startsWith('OggS')) {
+          const signature = ascii(0, bytes.length);
+          if (signature.toLowerCase().includes('theora')) return '';
+          return signature.includes('OpusHead') ? 'opus' : 'ogg';
+        }
+        if ((startsWith('ID3') && bytes.length >= 10) || hasFrameSync()) return 'mp3';
+        if (startsWith('#!AMR-WB')) return 'amr';
+        if (startsWith('#!AMR')) return 'amr';
+        if (startsWith('ADIF') || (bytes[0] === 0xff && (bytes[1] & 0xf6) === 0xf0)) return 'aac';
+        if (bytes[0] === 0x0b && bytes[1] === 0x77) return extension === 'ec3' ? 'ec3' : 'ac3';
+        if (bytes.length >= 12 && ascii(4, 4) === 'ftyp') {
+          const brands = ascii(8, Math.min(64, bytes.length - 8));
+          if (/M4A |M4B |M4P /i.test(brands)) return 'm4a';
+          if (/3gp[0-9 ]|3g2[0-9 ]/i.test(brands)) return '3gp';
+          if (['m4a', 'm4b', 'm4p'].includes(extension) && declared.startsWith('audio/')) return 'm4a';
+          if (extension === 'mp4' && declared.startsWith('audio/')) return 'mp4';
+          return '';
+        }
+        if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+          const text = ascii(0, bytes.length).toLowerCase();
+          if (text.includes('webm') && extension === 'webm') return 'webm';
+        }
+        if (bytes.length >= 16 && ascii(0, 4) === String.fromCharCode(0x30, 0x26, 0xb2, 0x75)) return 'wma';
+        return '';
+      }
+
+      function looksClearlyNonAudio(header) {
+        const bytes = header instanceof Uint8Array ? header : new Uint8Array(header || 0);
+        const ascii = String.fromCharCode(...bytes.subarray(0, Math.min(bytes.length, 256))).replace(/^\uFEFF/, '').trimStart().toLowerCase();
+        return (bytes[0] === 0x25 && ascii.startsWith('%pdf-'))
+          || (bytes[0] === 0x89 && ascii.startsWith('\u0089png'))
+          || ascii.startsWith('gif87a') || ascii.startsWith('gif89a')
+          || (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+          || (bytes[0] === 0x50 && bytes[1] === 0x4b && (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07))
+          || /^<!doctype\s+html|^<html\b|^\s*\{/.test(ascii);
+      }
+
+      async function inspectAudioFile(file, { timeoutMs = 15000, fileName: overrideFileName = '' } = {}) {
+        const fileName = overrideFileName || file?.name || '未命名音频';
+        if (!(file instanceof Blob) || !Number.isFinite(file.size)) return { ok: false, reason: '系统没有提供有效的文件对象。' };
+        if (file.size <= 0) return { ok: false, reason: '这是一个零字节空文件。' };
+        let header;
+        try {
+          header = await readFileHeader(file, timeoutMs);
+        } catch (error) {
+          return { ok: false, reason: error?.message || '读取文件失败。', readError: true };
+        }
+        if (looksClearlyNonAudio(header)) return { ok: false, reason: '文件内容是常见的非音频格式。' };
+        const detectedFormat = detectAudioFormat(header, fileName, file.type);
+        if (!detectedFormat) {
+          return { ok: false, reason: '无法从文件内容确认它是受支持的音频格式。请尝试 MP3、M4A/AAC、WAV 或 FLAC。' };
+        }
+        const format = AUDIO_FORMATS[detectedFormat];
+        const extension = fileExtension(fileName);
+        const declaredType = normalizedMimeType(file.type);
+        const extensionMismatch = Boolean(extension && !format.extensions.includes(extension));
+        const declaredAliases = {
+          mp3: ['audio/mp3', 'audio/mpeg3', 'audio/x-mp3', 'audio/x-mpeg3'],
+          webm: ['video/webm'],
+          opus: ['audio/opus']
+        }[detectedFormat] || [];
+        const mimeMismatch = Boolean(declaredType
+          && declaredType !== 'application/octet-stream'
+          && !format.mime.includes(declaredType)
+          && !declaredAliases.includes(declaredType));
+        return {
+          ok: true,
+          detectedFormat,
+          label: format.label,
+          mimeCandidates: audioMimeCandidates(fileName, file.type, detectedFormat),
+          mismatch: extensionMismatch || mimeMismatch,
+          extensionMismatch,
+          mimeMismatch,
+          declaredType
+        };
       }
 
       function ensureTrackMimeState(track) {
         if (!track) return [];
-        const candidates = audioMimeCandidates(track.fileName, track.type || track.blob?.type || '');
-        track.mimeCandidates = candidates.length ? candidates : [track.type || track.blob?.type || ''].filter(Boolean);
-        const currentType = String(track.blob?.type || track.type || '').toLowerCase();
-        const currentIndex = track.mimeCandidates.indexOf(currentType);
-        track.mimeIndex = currentIndex >= 0 ? currentIndex : 0;
+        const original = track.file || track.blob;
+        const candidates = audioMimeCandidates(track.fileName, original?.type || track.type || '', track.detectedFormat || '');
+        track.mimeCandidates = candidates.length ? candidates : [normalizedMimeType(original?.type || track.type || '')].filter(Boolean);
+        const originalType = normalizedMimeType(original?.type || track.type || '');
+        const originalIndex = track.mimeCandidates.indexOf(originalType);
+        if (!Number.isInteger(track.mimeIndex) || track.mimeIndex < 0 || track.mimeIndex >= track.mimeCandidates.length) {
+          track.mimeIndex = originalIndex >= 0 ? originalIndex : 0;
+        }
+        if (!Array.isArray(track.mimeTried)) track.mimeTried = [];
         return track.mimeCandidates;
+      }
+
+      function revokeTrackUrlLater(url) {
+        if (!url) return;
+        state.retiredObjectUrls.add(url);
+        setTimeout(() => {
+          const stillActive = ui.audio.currentSrc === url;
+          if (stillActive) {
+            recordDiagnostic('object-url-release-deferred-active', { url });
+            setTimeout(() => revokeTrackUrlLater(url), 3000);
+            return;
+          }
+          try { URL.revokeObjectURL(url); } catch (_) {}
+          state.retiredObjectUrls.delete(url);
+          recordDiagnostic('object-url-revoked', { stillActive, url });
+        }, 3000);
+      }
+
+      function revokeObjectUrl(url, { pageClosing = false } = {}) {
+        if (!url) return;
+        const stillActive = ui.audio.currentSrc === url;
+        if (stillActive && !pageClosing) {
+          recordDiagnostic('object-url-release-deferred-active', { url });
+          return;
+        }
+        try { URL.revokeObjectURL(url); } catch (_) {}
+        state.retiredObjectUrls.delete(url);
+        recordDiagnostic('object-url-revoked', { stillActive, url, pageClosing });
       }
 
       function applyTrackMimeCandidate(track, index) {
         const candidates = ensureTrackMimeState(track);
         if (!track || index < 0 || index >= candidates.length) return false;
         const nextType = candidates[index];
-        const nextBlob = normalizeAudioBlob(track.blob, track.fileName, nextType);
+        const original = track.file || track.blob;
+        if (!(original instanceof Blob)) return false;
+        let source = original;
+        if (normalizedMimeType(original.type) !== normalizedMimeType(nextType)) {
+          // Blob 的 type 只是媒体 MIME 提示；字节始终来自原始 File/Blob，不会执行转码。
+          source = new Blob([original], { type: nextType });
+        }
+        let nextUrl;
+        try {
+          nextUrl = URL.createObjectURL(source);
+        } catch (error) {
+          recordDiagnostic('object-url-create-failed', { name: track.fileName, message: error?.message || '' });
+          return false;
+        }
         const oldUrl = track.url;
-        track.blob = nextBlob;
-        track.file = nextBlob;
-        track.type = nextBlob.type || nextType;
+        if (oldUrl && oldUrl !== nextUrl) cancelTrackDurationProbe(track);
+        track.sourceBlob = source;
+        track.sourceType = source.type || nextType;
         track.mimeIndex = index;
-        track.url = URL.createObjectURL(nextBlob);
-        if (oldUrl) setTimeout(() => URL.revokeObjectURL(oldUrl), 3000);
+        if (!Array.isArray(track.mimeTried)) track.mimeTried = [];
+        if (!track.mimeTried.includes(index)) track.mimeTried.push(index);
+        track.url = nextUrl;
+        recordDiagnostic('object-url-created', { name: track.fileName, type: track.sourceType, size: original.size });
+        if (oldUrl && oldUrl !== nextUrl) revokeTrackUrlLater(oldUrl);
         return true;
       }
 
       function preferredMimeCandidateIndex(track) {
         const candidates = ensureTrackMimeState(track);
-        if (!candidates.length || typeof ui.audio.canPlayType !== 'function') return -1;
+        if (!candidates.length || typeof ui.audio.canPlayType !== 'function') return candidates.length ? 0 : -1;
 
         let maybeIndex = -1;
-        for (let index = 0; index < candidates.length; index += 1) {
-          const support = ui.audio.canPlayType(candidates[index]);
-          if (support === 'probably') return index;
-          if (support === 'maybe' && maybeIndex < 0) maybeIndex = index;
+        let probablyIndex = -1;
+        const supportResults = candidates.map(type => {
+          try {
+            return ui.audio.canPlayType(type) || '';
+          } catch (_) {
+            return '';
+          }
+        });
+        for (let index = 0; index < supportResults.length; index += 1) {
+          if (supportResults[index] === 'probably' && probablyIndex < 0) probablyIndex = index;
+          if (supportResults[index] === 'maybe' && maybeIndex < 0) maybeIndex = index;
         }
-        return maybeIndex;
+        recordDiagnostic('mime-capabilities', {
+          id: track?.id || '',
+          name: track?.fileName || '',
+          candidates: candidates.map((type, index) => ({ type, canPlayType: supportResults[index] }))
+        });
+        if (probablyIndex >= 0) return probablyIndex;
+        return maybeIndex >= 0 ? maybeIndex : (candidates.length ? 0 : -1);
       }
 
       function prepareTrackMimeSource(track) {
         const preferredIndex = preferredMimeCandidateIndex(track);
-        if (preferredIndex >= 0 && preferredIndex !== track.mimeIndex) {
-          applyTrackMimeCandidate(track, preferredIndex);
-        }
+        if (preferredIndex >= 0 && (!track.url || preferredIndex !== track.mimeIndex)) return applyTrackMimeCandidate(track, preferredIndex);
+        return Boolean(track?.url);
       }
 
       function notifyPersistenceIssue(error, action = '保存') {
         console.error(`音频${action}失败`, error);
+        recordDiagnostic(`indexeddb-${action}-failed`, { name: error?.name || '', message: error?.message || '' });
         if (state.persistenceWarningShown) return;
         state.persistenceWarningShown = true;
         const quotaHint = error?.name === 'QuotaExceededError'
           ? '浏览器可用存储空间不足，请删除部分已导入音频或清理站点数据。'
-          : '当前浏览器可能禁止本地文件页面使用持久化存储，刷新后新增音频可能无法恢复。';
+          : action === '恢复'
+            ? '这次无法读取本地音频库。程序没有清空或删除数据库；请刷新重试，并检查浏览器的站点存储或隐私设置。'
+            : action === '保存'
+              ? '当前浏览器没有保存成功；本次导入仍可在页面中播放，但刷新后可能丢失。'
+              : action === '删除'
+                ? '当前列表已更新，但删除记录没有保存；刷新后该文件可能重新出现。'
+                : action === '清空'
+                  ? '数据库清空没有完成，当前播放列表和已保存文件仍保留。'
+                  : '播放和本次页面使用不受影响，但新的列表顺序可能无法在刷新后保留。';
         alert(`音频${action}失败。${quotaHint}`);
       }
 
-      function trackFromRecord(record) {
+      function trackFromRecord(record, detectedFormat = '') {
         if (!record?.id || !(record.blob instanceof Blob)) return null;
         const fileName = record.fileName || `${record.name || '未命名音频'}`;
-        const mimeCandidates = audioMimeCandidates(fileName, record.type || record.blob.type || '');
-        const blob = normalizeAudioBlob(record.blob, fileName, mimeCandidates[0] || '');
+        const blob = record.blob;
+        const format = detectedFormat || record.detectedFormat || '';
+        const mimeCandidates = audioMimeCandidates(fileName, record.type || blob.type || '', format);
         return {
           id: record.id,
           blob,
           file: blob,
           fileName,
-          url: URL.createObjectURL(blob),
+          url: '',
           name: record.name || cleanName(fileName),
-          type: blob.type || record.type || record.blob.type || '',
+          type: blob.type || record.type || '',
+          detectedFormat: format,
           mimeCandidates,
-          mimeIndex: 0,
-          mimeRepaired: blob.type !== record.blob.type,
+          mimeIndex: -1,
+          mimeTried: [],
+          sourceBlob: null,
+          sourceType: '',
           lastModified: Number(record.lastModified) || 0,
           size: Number(record.size) || blob.size || 0,
           duration: Number(record.duration) || 0,
@@ -1893,9 +2270,28 @@
         };
       }
 
-      async function persistTrack(track, orderOverride = null) {
+      async function persistNewTrack(track) {
         try {
-          await audioStore.put(track, orderOverride);
+          await enqueueAudioWrite(async () => {
+            if (!state.tracks.includes(track)) return false;
+            await audioStore.putNew(track);
+            return true;
+          });
+          recordDiagnostic('indexeddb-track-saved', { id: track.id, name: track.fileName, size: track.size });
+          return true;
+        } catch (error) {
+          notifyPersistenceIssue(error, '保存');
+          return false;
+        }
+      }
+
+      async function persistTrackMetadata(track) {
+        try {
+          await enqueueAudioWrite(async () => {
+            if (!state.tracks.includes(track)) return false;
+            await audioStore.updateMetadata(track);
+            return true;
+          });
           return true;
         } catch (error) {
           notifyPersistenceIssue(error, '保存');
@@ -1906,20 +2302,64 @@
       async function restorePersistedTracks() {
         try {
           const records = await audioStore.getAll();
-          records
-            .sort((a, b) => {
-              const byOrder = (Number(a.order) || 0) - (Number(b.order) || 0);
-              if (byOrder) return byOrder;
-              const byAdded = (Number(a.addedAt) || 0) - (Number(b.addedAt) || 0);
-              return byAdded || String(a.id || '').localeCompare(String(b.id || ''));
-            })
-            .map(trackFromRecord)
-            .filter(Boolean)
-            .forEach(track => state.tracks.push(track));
-
+          const sortedRecords = records.sort((a, b) => {
+            const byOrder = (Number(a.order) || 0) - (Number(b.order) || 0);
+            if (byOrder) return byOrder;
+            const byAdded = (Number(a.addedAt) || 0) - (Number(b.addedAt) || 0);
+            return byAdded || String(a.id || '').localeCompare(String(b.id || ''));
+          });
           const savedTrackId = storage.get('english-focus-player-current-id', '');
           const savedTime = Number(storage.get('english-focus-player-current-time', 0));
-          const savedIndex = state.tracks.findIndex(track => track.id === savedTrackId);
+          const priorityIndex = sortedRecords.findIndex(record => record.id === savedTrackId);
+          const selectedPriorityIndex = priorityIndex >= 0 ? priorityIndex : (sortedRecords.length ? 0 : -1);
+          const priorityRecord = selectedPriorityIndex >= 0 ? sortedRecords[selectedPriorityIndex] : null;
+          let unavailableCount = 0;
+          const restoreRecord = async record => {
+            if (!record?.blob) {
+              unavailableCount += 1;
+              return null;
+            }
+            const result = await inspectAudioFile(record.blob, { timeoutMs: 5000, fileName: record.fileName });
+            if (!result.ok) {
+              unavailableCount += 1;
+              recordDiagnostic('indexeddb-track-unreadable', { id: record.id, name: record.fileName || '', reason: result.reason });
+              return null;
+            }
+            const track = trackFromRecord(record, result.detectedFormat);
+            if (!track || !prepareTrackMimeSource(track)) {
+              unavailableCount += 1;
+              return null;
+            }
+            return track;
+          };
+          const priorityTrack = priorityRecord ? await restoreRecord(priorityRecord) : null;
+          if (priorityTrack) {
+            state.tracks.push(priorityTrack);
+            state.currentIndex = 0;
+            state.restoring = false;
+            renderPlaylist();
+            const resumeTime = priorityTrack.id === savedTrackId && Number.isFinite(savedTime) ? savedTime : null;
+            loadTrack(0, false, resumeTime);
+          }
+
+          const remainingRecords = sortedRecords.filter((record, index) => index !== selectedPriorityIndex);
+          const restored = await mapWithConcurrency(remainingRecords, 2, restoreRecord);
+          unavailableCount += restored.filter(entry => entry?.error).length;
+          restored.filter(track => track?.id && track.blob instanceof Blob).forEach(track => state.tracks.push(track));
+          state.tracks.sort((a, b) => {
+            const byOrder = (Number(a.order) || 0) - (Number(b.order) || 0);
+            if (byOrder) return byOrder;
+            const byAdded = (Number(a.addedAt) || 0) - (Number(b.addedAt) || 0);
+            return byAdded || String(a.id || '').localeCompare(String(b.id || ''));
+          });
+          recordDiagnostic('indexeddb-restore-complete', {
+            storedCount: records.length,
+            restoredCount: state.tracks.length,
+            unavailableCount
+          });
+          if (unavailableCount > 0) {
+            alert(`${unavailableCount} 个已保存文件无法确认或读取为音频，已从当前列表跳过；原数据库记录没有删除。`);
+          }
 
           state.restoring = false;
           renderPlaylist();
@@ -1927,12 +2367,18 @@
           // 只按当前已恢复的可见顺序编号，不执行任何名称/时长/导入时间排序。
           if (state.tracks.length) void persistTrackOrder();
           if (state.tracks.length) {
-            loadTrack(savedIndex >= 0 ? savedIndex : 0, false, Number.isFinite(savedTime) ? savedTime : 0);
-            state.tracks.filter(track => !track.duration).forEach(probeDuration);
-            state.tracks.filter(track => track.mimeRepaired).forEach(track => {
-              track.mimeRepaired = false;
-              void persistTrack(track);
-            });
+            const resumeIndex = state.tracks.findIndex(track => track.id === (priorityTrack?.id || savedTrackId));
+            const selectedIndex = resumeIndex >= 0 ? resumeIndex : 0;
+            if (priorityTrack) {
+              state.currentIndex = selectedIndex;
+              if (!isCurrentMediaSource()) {
+                const resumeTime = priorityTrack.id === savedTrackId && Number.isFinite(savedTime) ? savedTime : null;
+                loadTrack(selectedIndex, false, resumeTime);
+              }
+            } else {
+              loadTrack(selectedIndex, false, null);
+            }
+            state.tracks.filter(track => !track.duration && track !== activeTrack()).forEach(probeDuration);
           }
         } catch (error) {
           state.restoring = false;
@@ -1943,7 +2389,7 @@
 
       function persistPlaybackPosition(force = false) {
         const track = activeTrack();
-        if (!track) return;
+        if (!track || !isCurrentMediaSource()) return;
         const current = Number(ui.audio.currentTime) || 0;
         const wholeSecond = Math.floor(current);
         if (!force && Math.abs(wholeSecond - state.lastStoredPlaybackSecond) < 2) return;
@@ -1956,14 +2402,21 @@
         return state.currentIndex >= 0 ? state.tracks[state.currentIndex] : null;
       }
 
+      function isCurrentMediaSource() {
+        const track = activeTrack();
+        if (!track?.url) return false;
+        const currentSource = ui.audio.currentSrc;
+        return currentSource ? currentSource === track.url : ui.audio.getAttribute('src') === track.url;
+      }
+
       function setNativeOutputDefaults() {
         ui.audio.defaultMuted = false;
-        ui.audio.muted = false;
-        ui.audio.volume = 1;
-        ui.audio.playbackRate = state.rate;
-        ui.audio.defaultPlaybackRate = state.rate;
-        if ('preservesPitch' in ui.audio) ui.audio.preservesPitch = true;
-        if ('webkitPreservesPitch' in ui.audio) ui.audio.webkitPreservesPitch = true;
+        try { ui.audio.playbackRate = state.rate; } catch (_) {}
+        try { ui.audio.defaultPlaybackRate = state.rate; } catch (_) {}
+        try {
+          if ('preservesPitch' in ui.audio) ui.audio.preservesPitch = true;
+          if ('webkitPreservesPitch' in ui.audio) ui.audio.webkitPreservesPitch = true;
+        } catch (_) {}
       }
 
       function updatePlayButton() {
@@ -1971,9 +2424,9 @@
         ui.playIcon.innerHTML = playing ? SVG.pause : SVG.play;
         ui.playButton.setAttribute('aria-label', playing ? '暂停' : '播放');
         ui.playButton.title = playing ? '暂停' : '播放';
-        if ('mediaSession' in navigator) {
-          navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
-        }
+        try {
+          if ('mediaSession' in navigator) navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+        } catch (_) {}
       }
 
       function updateModeButton() {
@@ -2145,10 +2598,12 @@
         renderPlaylist();
       }
 
-      function loadTrack(index, autoplay = false, resumeTime = null) {
+      function loadTrack(index, autoplay = false, resumeTime = null, userInitiated = false) {
         if (!Number.isInteger(index) || index < 0 || index >= state.tracks.length) return;
 
         const track = state.tracks[index];
+        persistPlaybackPosition(true);
+        cancelTrackDurationProbe(track);
         state.currentIndex = index;
         state.pendingRestoreTime = Number.isFinite(Number(resumeTime)) ? Math.max(0, Number(resumeTime)) : null;
         state.pendingRestoreTrackId = state.pendingRestoreTime !== null ? track.id : '';
@@ -2160,16 +2615,20 @@
         state.lastErrorKey = '';
         state.playIntent = Boolean(autoplay);
         state.mimeRetrying = false;
+        state.mimeRetryCount = 0;
         ensureTrackMimeState(track);
-        // 先用当前浏览器报告可解码的 MIME 设置 Blob URL，
-        // 让 iOS Safari 的首次 play() 仍发生在用户点击手势内。
-        prepareTrackMimeSource(track);
+        if (!prepareTrackMimeSource(track)) {
+          reportPlaybackError(new Error('无法创建本地音频资源。'));
+          return;
+        }
 
         ui.audio.pause();
         ui.audio.removeAttribute('src');
         ui.audio.load();
+        ui.audio.preload = 'metadata';
         ui.audio.src = track.url;
-        ui.audio.preload = 'auto';
+        ui.audio.load();
+        recordDiagnostic('track-loaded', { id: track.id, name: track.fileName, sourceType: track.sourceType, autoplay });
         setNativeOutputDefaults();
 
         setTrackName(track.name);
@@ -2183,18 +2642,18 @@
         updateMediaSession();
         updatePlayButton();
 
-        if (autoplay) startPlayback();
+        if (autoplay) startPlayback({ userInitiated });
       }
 
-      function tryNextMimeSource(expectedSourceSerial = state.sourceSerial) {
+      function tryNextMimeSource(expectedSourceSerial = state.sourceSerial, notifyUser = true) {
         const track = activeTrack();
-        if (!track || state.mimeRetrying || expectedSourceSerial !== state.sourceSerial) return false;
+        if (!track || state.mimeRetrying || expectedSourceSerial !== state.sourceSerial || state.mimeRetryCount >= 2) return false;
         const candidates = ensureTrackMimeState(track);
-        const nextIndex = (Number(track.mimeIndex) || 0) + 1;
-        if (nextIndex >= candidates.length) return false;
+        const tried = new Set(track.mimeTried);
+        const nextIndex = candidates.findIndex((candidate, index) => !tried.has(index));
+        if (nextIndex < 0) return false;
 
         state.mimeRetrying = true;
-        const shouldResume = state.playIntent;
         const resumeTime = Number(ui.audio.currentTime);
         if (Number.isFinite(resumeTime) && resumeTime > 0) {
           state.pendingRestoreTime = resumeTime;
@@ -2207,32 +2666,48 @@
         }
 
         state.sourceSerial += 1;
+        state.playRequestSerial += 1;
+        state.mimeRetryCount += 1;
         state.lastErrorKey = '';
+        state.playIntent = false;
         ui.audio.pause();
         ui.audio.removeAttribute('src');
         ui.audio.load();
+        ui.audio.preload = 'metadata';
         ui.audio.src = track.url;
-        ui.audio.preload = 'auto';
+        ui.audio.load();
         setNativeOutputDefaults();
         state.mimeRetrying = false;
-
-        if (shouldResume) setTimeout(() => startPlayback({ userInitiated: true }), 0);
+        recordDiagnostic('mime-source-retry', {
+          id: track.id,
+          name: track.fileName,
+          type: track.sourceType,
+          retry: state.mimeRetryCount,
+          automaticPlaybackResumed: false
+        });
+        if (notifyUser) alert('已尝试另一种音频 MIME 标记。请再次点击播放；MIME 标记不会转换音频编码。');
         return true;
       }
 
       function describePlaybackError(error) {
         if (error?.name === 'NotAllowedError') {
-          return '浏览器未允许本次播放，请直接点击中央播放按钮重试。';
+          return '浏览器没有允许这次播放。请直接点击中央播放按钮；自动切歌在部分 iPhone 浏览器中需要再次点击播放。';
         }
         if (error?.name === 'NotSupportedError') {
           return '当前浏览器无法解码这个音频文件。请尝试转换为 MP3、M4A/AAC、WAV 或 AIFF；OGG/OPUS 的支持取决于 iOS 版本。';
+        }
+        if (error?.name === 'AbortError') {
+          return '这次播放请求已取消，请再次点击播放。';
+        }
+        if (error?.name === 'NotReadableError') {
+          return '浏览器无法读取这个文件。如果它来自 iCloud 或第三方云盘，请等文件下载完成后重新导入。';
         }
         const mediaError = ui.audio.error;
         if (mediaError) {
           const messages = {
             1: '音频加载被中止。',
-            2: '读取音频文件时发生错误。',
-            3: '音频文件无法解码，文件可能损坏或编码不受支持。',
+            2: '读取音频文件时发生错误。如果文件来自 iCloud 或第三方云盘，请等它下载完成后重新导入。',
+            3: '音频文件无法解码，文件可能损坏或编码不受当前浏览器支持。',
             4: '当前浏览器不支持这个音频格式。请尝试转换为 MP3、M4A/AAC、WAV 或 AIFF；OGG/OPUS 的支持取决于 iOS 版本。'
           };
           return messages[mediaError.code] || '音频播放失败。';
@@ -2246,6 +2721,13 @@
         const key = `${activeTrack()?.name || ''}|${message}`;
         if (key === state.lastErrorKey) return;
         state.lastErrorKey = key;
+        recordDiagnostic('playback-error-reported', {
+          id: activeTrack()?.id || '',
+          name: activeTrack()?.fileName || '',
+          exception: error?.name || '',
+          mediaErrorCode: ui.audio.error?.code || 0,
+          message
+        });
         console.error(message, error || ui.audio.error);
         alert(message);
       }
@@ -2258,8 +2740,9 @@
 
         const track = activeTrack();
         if (!ui.audio.getAttribute('src') && track?.url) {
+          ui.audio.preload = 'metadata';
           ui.audio.src = track.url;
-          ui.audio.preload = 'auto';
+          ui.audio.load();
         }
 
         setNativeOutputDefaults();
@@ -2267,35 +2750,65 @@
         state.playIntent = true;
         const requestSerial = ++state.playRequestSerial;
         const sourceSerial = state.sourceSerial;
+        recordDiagnostic('play-request', {
+          id: track?.id || '',
+          name: track?.fileName || '',
+          userInitiated,
+          readyState: ui.audio.readyState,
+          networkState: ui.audio.networkState,
+          sourceType: track?.sourceType || ''
+        });
+
+        const handleFailure = error => {
+          if (requestSerial !== state.playRequestSerial || sourceSerial !== state.sourceSerial) return;
+          recordDiagnostic('play-promise-rejected', {
+            id: track?.id || '',
+            name: track?.fileName || '',
+            userInitiated,
+            exception: error?.name || '',
+            mediaErrorCode: ui.audio.error?.code || 0,
+            readyState: ui.audio.readyState,
+            networkState: ui.audio.networkState
+          });
+          if (error?.name === 'AbortError') {
+            state.playIntent = false;
+            return;
+          }
+          state.playIntent = false;
+          if (error?.name === 'NotSupportedError') {
+            if (!tryNextMimeSource(sourceSerial, true)) reportPlaybackError(error);
+            return;
+          }
+          // 拒绝播放权限、读取错误和解码错误都不能靠更换 MIME 提示解决。
+          reportPlaybackError(error);
+        };
 
         let result;
         try {
           // 中央按钮的 click 事件会同步进入这里，保留浏览器认可的用户手势。
           result = ui.audio.play();
         } catch (error) {
-          setTimeout(() => {
-            if (requestSerial !== state.playRequestSerial || sourceSerial !== state.sourceSerial) return;
-            if (!tryNextMimeSource(sourceSerial)) reportPlaybackError(error);
-          }, 0);
+          handleFailure(error);
           return;
         }
 
         if (result && typeof result.then === 'function') {
           result.then(() => {
-            if (requestSerial === state.playRequestSerial) state.lastErrorKey = '';
+            if (requestSerial === state.playRequestSerial && sourceSerial === state.sourceSerial) {
+              state.lastErrorKey = '';
+              recordDiagnostic('play-promise-resolved', { id: track?.id || '', name: track?.fileName || '', userInitiated });
+            }
           }).catch(error => {
-            // 忽略已经被新一次播放操作取代的旧 Promise，避免延迟弹出错误提示。
-            setTimeout(() => {
-              if (requestSerial !== state.playRequestSerial || sourceSerial !== state.sourceSerial) return;
-              if (!ui.audio.paused && !ui.audio.ended) return;
-              if (!tryNextMimeSource(sourceSerial)) reportPlaybackError(error);
-            }, 0);
+            // 忽略被暂停、切曲或新播放请求取代的旧 Promise。
+            if (!ui.audio.paused && !ui.audio.ended) return;
+            handleFailure(error);
           });
         }
       }
 
       function togglePlayback() {
         if (!ui.audio.paused && !ui.audio.ended) {
+          persistPlaybackPosition(true);
           state.playRequestSerial += 1;
           state.playIntent = false;
           ui.audio.pause();
@@ -2316,7 +2829,7 @@
         if (state.currentIndex < 0) return;
         const shouldResumePlayback = ui.audio.paused || ui.audio.ended;
         const didSeek = seekTo(ui.audio.currentTime + Number(delta || 0));
-        if (didSeek && shouldResumePlayback) startPlayback();
+        if (didSeek && shouldResumePlayback) startPlayback({ userInitiated: true });
       }
 
       function seekFromPointer(clientX) {
@@ -2369,7 +2882,7 @@
           .then(async () => {
             if (revision !== orderPersistRevision) return;
             try {
-              await audioStore.updateOrders(snapshot);
+              await enqueueAudioWrite(() => audioStore.updateOrders(snapshot));
             } catch (error) {
               notifyPersistenceIssue(error, '保存播放顺序');
             }
@@ -2631,16 +3144,16 @@
         return state.currentIndex + 1 < state.tracks.length ? state.currentIndex + 1 : 0;
       }
 
-      function previousTrack() {
+      function previousTrack(userInitiated = false) {
         if (!state.tracks.length) return;
         const index = state.currentIndex > 0 ? state.currentIndex - 1 : state.tracks.length - 1;
-        loadTrack(index, true);
+        loadTrack(index, true, null, Boolean(userInitiated));
       }
 
-      function nextTrack() {
+      function nextTrack(userInitiated = false) {
         if (!state.tracks.length) return;
         const index = state.currentIndex + 1 < state.tracks.length ? state.currentIndex + 1 : 0;
-        loadTrack(index, true);
+        loadTrack(index, true, null, Boolean(userInitiated));
       }
 
       function handleEnded() {
@@ -2656,63 +3169,150 @@
       }
 
       function probeDuration(track) {
-        const probe = document.createElement('audio');
-        probe.preload = 'metadata';
-        probe.muted = true;
-        const finish = () => {
-          probe.removeAttribute('src');
-          probe.load();
-        };
-        probe.addEventListener('loadedmetadata', () => {
-          if (Number.isFinite(probe.duration) && probe.duration > 0) {
-            track.duration = probe.duration;
-            if (activeTrack() === track) ui.duration.textContent = formatTime(track.duration);
-            renderPlaylist();
-            void persistTrack(track);
+        if (!track || track.duration > 0 || activeTrack() === track || !state.tracks.includes(track)) return;
+        if (state.durationProbeQueue.some(item => item.id === track.id) || state.durationProbeByTrack.has(track.id)) return;
+        state.durationProbeQueue.push(track);
+        drainDurationProbes();
+      }
+
+      function drainDurationProbes() {
+        const maximumConcurrentProbes = 2;
+        while (state.activeDurationProbes < maximumConcurrentProbes && state.durationProbeQueue.length) {
+          const track = state.durationProbeQueue.shift();
+          if (!track || !state.tracks.includes(track) || activeTrack() === track) continue;
+          const probe = document.createElement('audio');
+          probe.preload = 'metadata';
+          const sourceUrl = track.url;
+          let finished = false;
+          state.activeDurationProbes += 1;
+
+          const finish = (duration = 0, reason = '') => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+            state.durationProbeByTrack.delete(track.id);
+            try { probe.pause(); } catch (_) {}
+            probe.removeAttribute('src');
+            try { probe.load(); } catch (_) {}
+            if (Number.isFinite(duration) && duration > 0 && state.tracks.includes(track)) {
+              track.duration = duration;
+              renderPlaylist();
+              void persistTrackMetadata(track);
+            }
+            recordDiagnostic('duration-probe-finished', {
+              id: track.id,
+              name: track.fileName,
+              duration: Number.isFinite(duration) ? duration : 0,
+              reason
+            });
+            state.activeDurationProbes = Math.max(0, state.activeDurationProbes - 1);
+            drainDurationProbes();
+          };
+          const timeout = setTimeout(() => finish(0, 'timeout'), 12000);
+          state.durationProbeByTrack.set(track.id, { cancel: () => finish(0, 'cancelled') });
+          probe.addEventListener('loadedmetadata', () => finish(Number(probe.duration), 'loadedmetadata'), { once: true });
+          probe.addEventListener('error', () => finish(0, `media-error-${probe.error?.code || 0}`), { once: true });
+          try {
+            probe.src = sourceUrl;
+            probe.load();
+            recordDiagnostic('duration-probe-started', { id: track.id, name: track.fileName });
+          } catch (error) {
+            finish(0, error?.name || 'load-failed');
           }
-          finish();
-        }, { once: true });
-        probe.addEventListener('error', finish, { once: true });
-        probe.src = track.url;
+        }
+      }
+
+      function cancelTrackDurationProbe(track) {
+        if (!track) return;
+        state.durationProbeQueue = state.durationProbeQueue.filter(item => item.id !== track.id);
+        state.durationProbeByTrack.get(track.id)?.cancel();
       }
 
       async function addFiles(fileList) {
         const files = Array.from(fileList || []);
-        const accepted = files.filter(isLikelyAudio);
-        const rejected = files.length - accepted.length;
+        if (!files.length) return;
+        recordDiagnostic('file-selection-change', {
+          count: files.length,
+          files: files.map(file => ({ name: file.name || '未命名音频', size: file.size, type: file.type || '' }))
+        });
+        const inspected = await mapWithConcurrency(files, 4, async file => ({ file, result: await inspectAudioFile(file) }));
+        const accepted = [];
+        const rejected = [];
+        inspected.forEach((entry, index) => {
+          const file = files[index];
+          const result = entry?.result || { ok: false, reason: entry?.error?.message || '检查文件失败。' };
+          if (!result.ok) {
+            rejected.push({ fileName: file?.name || '未命名音频', reason: result.reason });
+            recordDiagnostic('file-rejected', {
+              name: file?.name || '未命名音频',
+              size: file?.size || 0,
+              type: file?.type || '',
+              reason: result.reason
+            });
+            return;
+          }
+          accepted.push({ file, result });
+        });
         const lastOrder = state.tracks.reduce((max, track) => Math.max(max, Number(track.order) || 0), 0);
         const orderBase = lastOrder + 1000;
         const addedTracks = [];
+        const mismatchedFiles = [];
 
-        accepted.forEach((file, offset) => {
+        accepted.forEach(({ file, result }, offset) => {
           const fileName = file.name || '未命名音频';
-          const mimeCandidates = audioMimeCandidates(fileName, file.type || '');
-          const blob = normalizeAudioBlob(file, fileName, mimeCandidates[0] || '');
           const track = {
             id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
-            file: blob,
-            blob,
+            file,
+            blob: file,
             fileName,
-            url: URL.createObjectURL(blob),
+            url: '',
             name: cleanName(fileName),
-            type: blob.type || file.type || '',
-            mimeCandidates,
-            mimeIndex: 0,
+            type: file.type || '',
+            detectedFormat: result.detectedFormat,
+            mimeCandidates: result.mimeCandidates,
+            mimeIndex: -1,
+            mimeTried: [],
+            sourceBlob: null,
+            sourceType: '',
             lastModified: Number(file.lastModified) || 0,
-            size: blob.size || file.size || 0,
+            size: file.size || 0,
             duration: 0,
-            addedAt: Date.now(),
+            addedAt: Date.now() + offset,
             order: orderBase + offset * 1000
           };
+          if (!prepareTrackMimeSource(track)) {
+            rejected.push({ fileName, reason: '浏览器无法为这个文件创建本地播放地址。' });
+            return;
+          }
           state.tracks.push(track);
           addedTracks.push(track);
-          probeDuration(track);
+          if (result.mismatch) mismatchedFiles.push(`${fileName}（按 ${result.label} 内容识别）`);
+          recordDiagnostic('file-added-to-playlist', {
+            id: track.id,
+            name: track.fileName,
+            size: track.size,
+            declaredType: file.type || '',
+            detectedFormat: result.detectedFormat,
+            objectUrlCreated: Boolean(track.url)
+          });
         });
 
         renderPlaylist();
         if (state.currentIndex < 0 && state.tracks.length) loadTrack(0, false);
-        await Promise.all(addedTracks.map(persistTrack));
-        if (rejected > 0) alert(`已跳过 ${rejected} 个无法识别为音频的文件。`);
+        addedTracks.forEach(track => {
+          if (track !== activeTrack()) probeDuration(track);
+          void persistNewTrack(track);
+        });
+
+        const messages = [];
+        if (mismatchedFiles.length) {
+          messages.push(`有 ${mismatchedFiles.length} 个文件的扩展名与内容不一致，已按内容识别：\n${mismatchedFiles.slice(0, 3).join('\n')}`);
+        }
+        if (rejected.length) {
+          const details = rejected.slice(0, 3).map(item => `${item.fileName}：${item.reason}`).join('\n');
+          messages.push(`已跳过 ${rejected.length} 个无法验证为音频的文件：\n${details}`);
+        }
+        if (messages.length) alert(messages.join('\n\n'));
       }
 
       function queueFileImport(fileList) {
@@ -2723,9 +3323,10 @@
           return importQueue;
         }
         importQueue = importQueue.then(async () => {
-          await ensurePersistentStorage();
+          if (state.restorePromise) await state.restorePromise;
           await addFiles(files);
         }).catch(error => {
+          recordDiagnostic('file-import-failed', { name: error?.name || '', message: error?.message || '' });
           console.error('导入音频失败', error);
           alert(`导入音频失败：${error?.message || '未知错误'}`);
         });
@@ -2747,14 +3348,21 @@
         if (!confirmed) return;
 
         try {
-          await audioStore.clear();
+          await enqueueAudioWrite(() => audioStore.clear());
         } catch (error) {
           notifyPersistenceIssue(error, '清空');
           return;
         }
 
         ui.audio.pause();
-        state.tracks.forEach(track => URL.revokeObjectURL(track.url));
+        ui.audio.removeAttribute('src');
+        ui.audio.load();
+        state.durationProbeQueue = [];
+        state.tracks.forEach(track => {
+          cancelTrackDurationProbe(track);
+          revokeObjectUrl(track.url);
+        });
+        Array.from(state.retiredObjectUrls).forEach(url => revokeObjectUrl(url));
         state.tracks.length = 0;
         ui.fileInput.value = '';
         resetPlayerView();
@@ -2765,15 +3373,17 @@
         if (!Number.isInteger(index) || index < 0 || index >= state.tracks.length) return;
         const deletingCurrent = index === state.currentIndex;
         const wasPlaying = !ui.audio.paused && !ui.audio.ended;
+        persistPlaybackPosition(true);
         const [removed] = state.tracks.splice(index, 1);
+        cancelTrackDurationProbe(removed);
 
         if (deletingCurrent) {
           ui.audio.pause();
           ui.audio.removeAttribute('src');
           ui.audio.load();
         }
-        URL.revokeObjectURL(removed.url);
-        audioStore.delete(removed.id).catch(error => notifyPersistenceIssue(error, '删除'));
+        revokeObjectUrl(removed.url);
+        void enqueueAudioWrite(() => audioStore.delete(removed.id)).catch(error => notifyPersistenceIssue(error, '删除'));
 
         if (!state.tracks.length) {
           resetPlayerView();
@@ -2781,7 +3391,7 @@
         }
 
         if (deletingCurrent) {
-          loadTrack(Math.min(index, state.tracks.length - 1), wasPlaying);
+          loadTrack(Math.min(index, state.tracks.length - 1), wasPlaying, null, true);
         } else {
           if (index < state.currentIndex) state.currentIndex -= 1;
           renderPlaylist();
@@ -2935,15 +3545,22 @@
       function installMediaSessionActions() {
         if (!('mediaSession' in navigator)) return;
         const handlers = {
-          play: startPlayback,
-          pause: () => ui.audio.pause(),
-          seekbackward: details => seekBy(-(details.seekOffset || 10)),
-          seekforward: details => seekBy(details.seekOffset || 10),
-          previoustrack: previousTrack,
-          nexttrack: nextTrack,
+          play: () => startPlayback({ userInitiated: true }),
+          pause: () => {
+            persistPlaybackPosition(true);
+            state.playIntent = false;
+            ui.audio.pause();
+          },
+          seekbackward: details => seekBy(-(Number(details?.seekOffset) || 10)),
+          seekforward: details => seekBy(Number(details?.seekOffset) || 10),
+          previoustrack: () => previousTrack(true),
+          nexttrack: () => nextTrack(true),
           seekto: details => {
-            if (details.fastSeek && typeof ui.audio.fastSeek === 'function') ui.audio.fastSeek(details.seekTime);
-            else seekTo(details.seekTime);
+            const target = Number(details?.seekTime);
+            if (!Number.isFinite(target)) return;
+            if (details?.fastSeek && typeof ui.audio.fastSeek === 'function') {
+              try { ui.audio.fastSeek(target); } catch (_) { seekTo(target); }
+            } else seekTo(target);
           }
         };
         Object.entries(handlers).forEach(([action, handler]) => {
@@ -3107,6 +3724,8 @@
 
       function bindEvents() {
         installPlaylistScrollBridge();
+        ui.fileInput.addEventListener('click', () => recordDiagnostic('file-picker-opened'));
+        ui.fileInput.addEventListener('cancel', () => recordDiagnostic('file-picker-cancelled'));
         ui.fileInput.addEventListener('change', event => {
           const input = event.currentTarget;
           // FileList 是动态对象；必须先复制，再清空 input，否则所选文件会立即变成空列表。
@@ -3147,7 +3766,7 @@
             return;
           }
           const item = event.target.closest('[data-index]');
-          if (item) loadTrack(Number(item.dataset.index), true);
+          if (item) loadTrack(Number(item.dataset.index), true, null, true);
         });
 
         ui.audioList.addEventListener('keydown', event => {
@@ -3166,7 +3785,7 @@
           }
           if (state.reorderMode || handle || (event.key !== 'Enter' && event.key !== ' ')) return;
           event.preventDefault();
-          loadTrack(Number(item.dataset.index), true);
+          loadTrack(Number(item.dataset.index), true, null, true);
         });
 
         ui.reorderButton.addEventListener('click', () => setReorderMode(!state.reorderMode));
@@ -3450,13 +4069,29 @@
           if (event.key === 'End' && Number.isFinite(ui.audio.duration)) { event.preventDefault(); seekTo(ui.audio.duration); }
         });
 
+        ['loadedmetadata', 'canplay', 'playing', 'waiting', 'error', 'abort', 'emptied', 'play', 'pause', 'ended', 'seeking', 'seeked']
+          .forEach(eventName => ui.audio.addEventListener(eventName, () => {
+            const track = activeTrack();
+            recordDiagnostic(`media-${eventName}`, {
+              id: track?.id || '',
+              name: track?.fileName || '',
+              sourceMatchesCurrentTrack: isCurrentMediaSource(),
+              readyState: ui.audio.readyState,
+              networkState: ui.audio.networkState,
+              currentTime: Number(ui.audio.currentTime) || 0,
+              duration: Number.isFinite(ui.audio.duration) ? ui.audio.duration : null,
+              mediaErrorCode: ui.audio.error?.code || 0
+            });
+          }));
+
         ui.audio.addEventListener('loadedmetadata', () => {
+          if (!isCurrentMediaSource()) return;
           const track = activeTrack();
           const duration = Number(ui.audio.duration);
           if (track && Number.isFinite(duration) && duration > 0) {
             track.duration = duration;
             renderPlaylist();
-            void persistTrack(track);
+            void persistTrackMetadata(track);
           }
 
           let targetTime = null;
@@ -3480,18 +4115,26 @@
           setNativeOutputDefaults();
           updateProgress();
         });
-        ui.audio.addEventListener('durationchange', updateProgress);
+        ui.audio.addEventListener('durationchange', () => {
+          if (isCurrentMediaSource()) updateProgress();
+        });
         ui.audio.addEventListener('timeupdate', () => {
+          if (!isCurrentMediaSource()) return;
           updateProgress();
           persistPlaybackPosition(false);
         });
-        ui.audio.addEventListener('play', updatePlayButton);
-        ui.audio.addEventListener('playing', updatePlayButton);
+        ui.audio.addEventListener('play', () => {
+          if (isCurrentMediaSource()) updatePlayButton();
+        });
+        ui.audio.addEventListener('playing', () => {
+          if (isCurrentMediaSource()) updatePlayButton();
+        });
         ui.audio.addEventListener('pause', () => {
+          if (!isCurrentMediaSource()) return;
           updatePlayButton();
-          persistPlaybackPosition(true);
         });
         ui.audio.addEventListener('ended', () => {
+          if (!isCurrentMediaSource()) return;
           persistPlaybackPosition(true);
           handleEnded();
         });
@@ -3499,18 +4142,17 @@
           const sourceSerial = state.sourceSerial;
           const error = ui.audio.error;
           setTimeout(() => {
-            if (sourceSerial !== state.sourceSerial) return;
-            if (!tryNextMimeSource(sourceSerial)) reportPlaybackError(error);
+            if (sourceSerial !== state.sourceSerial || !isCurrentMediaSource()) return;
+            if (error?.code === 4 && tryNextMimeSource(sourceSerial, state.playIntent)) return;
+            state.playIntent = false;
+            reportPlaybackError(error);
           }, 0);
         });
-        ui.audio.addEventListener('volumechange', () => {
-          if (ui.audio.muted || ui.audio.volume !== 1) {
-            ui.audio.muted = false;
-            ui.audio.volume = 1;
-          }
-        });
         ui.audio.addEventListener('ratechange', () => {
-          if (Math.abs(ui.audio.playbackRate - state.rate) > 0.001) ui.audio.playbackRate = state.rate;
+          if (!isCurrentMediaSource()) return;
+          if (Math.abs(ui.audio.playbackRate - state.rate) > 0.001) {
+            try { ui.audio.playbackRate = state.rate; } catch (_) {}
+          }
         });
 
         document.addEventListener('keydown', event => {
@@ -3526,15 +4168,27 @@
 
         window.addEventListener('resize', updateTrackNameMarquee);
 
-        window.addEventListener('beforeunload', () => {
+        document.addEventListener('visibilitychange', () => {
+          recordDiagnostic('visibility-change', { state: document.visibilityState, playing: !ui.audio.paused });
+          if (document.visibilityState === 'hidden') persistPlaybackPosition(true);
+        });
+        window.addEventListener('pagehide', event => {
           persistPlaybackPosition(true);
-          state.tracks.forEach(track => URL.revokeObjectURL(track.url));
+          recordDiagnostic('pagehide', { persisted: Boolean(event.persisted) });
+          if (event.persisted) return;
+          state.tracks.forEach(track => revokeObjectUrl(track.url, { pageClosing: true }));
+          Array.from(state.retiredObjectUrls).forEach(url => revokeObjectUrl(url, { pageClosing: true }));
           if (state.floatingWindow && !state.floatingWindow.closed) state.floatingWindow.close();
+        });
+        window.addEventListener('pageshow', event => {
+          recordDiagnostic('pageshow', { persisted: Boolean(event.persisted) });
+          if (event.persisted) updatePlayButton();
         });
       }
 
       async function initialize() {
         setNativeOutputDefaults();
+        if (state.diagnosticsEnabled) recordDiagnostic('environment', browserEnvironment());
         renderPlaylist();
         updatePlayButton();
 
@@ -3552,10 +4206,13 @@
         updateModeButton();
         bindEvents();
         installMediaSessionActions();
-        await restorePersistedTracks();
-        await ensurePersistentStorage();
+        state.restorePromise = restorePersistedTracks();
+        await state.restorePromise;
+        void ensurePersistentStorage();
 
         window.__englishListeningPlayer = {
+          getEnvironment: browserEnvironment,
+          getDiagnostics: () => state.diagnostics.slice(),
           getState: () => ({
             trackCount: state.tracks.length,
             currentIndex: state.currentIndex,
@@ -3566,7 +4223,14 @@
             duration: ui.audio.duration,
             readyState: ui.audio.readyState,
             networkState: ui.audio.networkState,
+            mediaErrorCode: ui.audio.error?.code || 0,
             playbackRate: ui.audio.playbackRate,
+            persistentStorageGranted: state.persistentStorageGranted,
+            activeDurationProbes: state.activeDurationProbes,
+            queuedDurationProbes: state.durationProbeQueue.length,
+            storageNamespace: STORAGE_PATH_KEY,
+            databaseName: DB_NAME,
+            diagnosticsEnabled: state.diagnosticsEnabled,
             reorderMode: state.reorderMode,
             trackOrder: state.tracks.map(track => track.name)
           }),
