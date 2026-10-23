@@ -177,6 +177,7 @@
 
     .section-head h2 { margin: 0; font-size: 18px; }
     .import-button {
+      position: relative;
       display: inline-flex;
       align-items: center;
       gap: 7px;
@@ -191,7 +192,19 @@
       font-size: 14px;
     }
     .import-button { white-space: nowrap; }
-    .import-button input { display: none; }
+    .import-button input {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+    .import-button:focus-within {
+      outline: 3px solid rgba(var(--primary-rgb), .28);
+      outline-offset: 3px;
+    }
 
     .playlist-actions {
       display: flex;
@@ -1826,6 +1839,26 @@
         return true;
       }
 
+      function preferredMimeCandidateIndex(track) {
+        const candidates = ensureTrackMimeState(track);
+        if (!candidates.length || typeof ui.audio.canPlayType !== 'function') return -1;
+
+        let maybeIndex = -1;
+        for (let index = 0; index < candidates.length; index += 1) {
+          const support = ui.audio.canPlayType(candidates[index]);
+          if (support === 'probably') return index;
+          if (support === 'maybe' && maybeIndex < 0) maybeIndex = index;
+        }
+        return maybeIndex;
+      }
+
+      function prepareTrackMimeSource(track) {
+        const preferredIndex = preferredMimeCandidateIndex(track);
+        if (preferredIndex >= 0 && preferredIndex !== track.mimeIndex) {
+          applyTrackMimeCandidate(track, preferredIndex);
+        }
+      }
+
       function notifyPersistenceIssue(error, action = '保存') {
         console.error(`音频${action}失败`, error);
         if (state.persistenceWarningShown) return;
@@ -2128,6 +2161,9 @@
         state.playIntent = Boolean(autoplay);
         state.mimeRetrying = false;
         ensureTrackMimeState(track);
+        // 先用当前浏览器报告可解码的 MIME 设置 Blob URL，
+        // 让 iOS Safari 的首次 play() 仍发生在用户点击手势内。
+        prepareTrackMimeSource(track);
 
         ui.audio.pause();
         ui.audio.removeAttribute('src');
@@ -2189,7 +2225,7 @@
           return '浏览器未允许本次播放，请直接点击中央播放按钮重试。';
         }
         if (error?.name === 'NotSupportedError') {
-          return '当前浏览器无法解码这个音频格式，请换用 MP3、WAV、M4A、AAC、FLAC、OGG 或 OPUS。';
+          return '当前浏览器无法解码这个音频文件。请尝试转换为 MP3、M4A/AAC、WAV 或 AIFF；OGG/OPUS 的支持取决于 iOS 版本。';
         }
         const mediaError = ui.audio.error;
         if (mediaError) {
@@ -2197,7 +2233,7 @@
             1: '音频加载被中止。',
             2: '读取音频文件时发生错误。',
             3: '音频文件无法解码，文件可能损坏或编码不受支持。',
-            4: '当前浏览器不支持这个音频格式。'
+            4: '当前浏览器不支持这个音频格式。请尝试转换为 MP3、M4A/AAC、WAV 或 AIFF；OGG/OPUS 的支持取决于 iOS 版本。'
           };
           return messages[mediaError.code] || '音频播放失败。';
         }
